@@ -3,6 +3,11 @@ const ALLOWED_ORIGINS = new Set([
   "http://localhost:4173",
 ]);
 
+const MAX_TITLE_LENGTH = 200;
+const UPSTREAM_TIMEOUT_MS = 5000;
+const CACHE_TTL_MS = 6 * 60 * 60 * 1000; // results rarely change; saves OMDb quota on repeat searches
+const CACHE_MAX_ENTRIES = 500;
+
 function corsHeaders(origin) {
   const headers = { "Content-Type": "application/json" };
   if (ALLOWED_ORIGINS.has(origin)) {
@@ -12,13 +17,65 @@ function corsHeaders(origin) {
   return headers;
 }
 
+function jsonResponse(body, status, origin, extraHeaders = {}) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { ...corsHeaders(origin), ...extraHeaders },
+  });
+}
+
+function errorResponse(message, status, origin) {
+  return jsonResponse({ Response: "False", Error: message }, status, origin);
+}
+
+// Per-isolate memory cache. Not shared across Cloudflare locations, but it
+// absorbs repeat searches during a race night without touching OMDb or RT.
+const cache = new Map();
+
+function cacheGet(key) {
+  const hit = cache.get(key);
+  if (!hit) return null;
+  if (Date.now() > hit.expires) {
+    cache.delete(key);
+    return null;
+  }
+  return hit.data;
+}
+
+function cacheSet(key, data) {
+  if (cache.size >= CACHE_MAX_ENTRIES) cache.delete(cache.keys().next().value); // drop oldest
+  cache.set(key, { data, expires: Date.now() + CACHE_TTL_MS });
+}
+
 const RT_HEADERS = {
   "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
   "Accept": "text/html",
 };
 
+const ENTITIES = { amp: "&", quot: '"', apos: "'", lt: "<", gt: ">", nbsp: " " };
+
+function decodeEntities(s) {
+  return s.replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/gi, (m, code) => {
+    if (code[0] === "#") {
+      const n = code[1].toLowerCase() === "x" ? parseInt(code.slice(2), 16) : parseInt(code.slice(1), 10);
+      return Number.isFinite(n) ? String.fromCodePoint(n) : m;
+    }
+    return ENTITIES[code.toLowerCase()] ?? m;
+  });
+}
+
+// "Grey's Anatomy" / "Grey&#39;s Anatomy" / "Law & Order" / "Law and Order" all compare equal.
 function norm(s) {
-  return (s || "").toLowerCase().trim();
+  return decodeEntities(s || "")
+    .toLowerCase()
+    .replace(/&/g, " and ")
+    .replace(/[^a-z0-9]+/g, "");
+}
+
+// OMDb years look like "2010", "2008–2013" or "2019–"; RT wants the first year.
+function firstYear(y) {
+  const m = String(y || "").match(/\d{4}/);
+  return m ? m[0] : "";
 }
 
 // OMDb frequently has no Rotten Tomatoes rating for TV series, shorts, and
@@ -30,7 +87,7 @@ function norm(s) {
 async function findRottenTomatoesScore(title, year, mediaType) {
   try {
     const searchUrl = `https://www.rottentomatoes.com/search?search=${encodeURIComponent(title)}`;
-    const res = await fetch(searchUrl, { headers: RT_HEADERS });
+    const res = await fetch(searchUrl, { headers: RT_HEADERS, signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS) });
     if (!res.ok) return null;
     const html = await res.text();
 
@@ -61,19 +118,21 @@ async function findRottenTomatoesScore(title, year, mediaType) {
       });
     }
 
-    if (!candidates.length) return null;
-
     const wantedName = norm(title);
+    const wantedYear = firstYear(year);
     const sameType = (c) => c.path.startsWith(preferredPath);
     const nameEq = (c) => norm(c.name) === wantedName;
-    const yearEq = (c) => !year || !c.year || c.year === String(year);
+    // "Gran Turismo" -> "Gran Turismo: Based on a True Story"
+    const namePrefix = (c) => norm(c.name).startsWith(wantedName);
+    const yearKnownEq = (c) => Boolean(wantedYear && c.year) && c.year === wantedYear;
+    const yearOk = (c) => !wantedYear || !c.year || c.year === wantedYear;
 
+    // Only accept a result that is clearly the same title. Showing no RT score
+    // is better than showing a different movie's score.
     const pick =
-      candidates.find((c) => sameType(c) && nameEq(c) && yearEq(c)) ||
-      candidates.find((c) => sameType(c) && nameEq(c)) ||
-      candidates.find((c) => nameEq(c)) ||
-      candidates.find((c) => sameType(c)) ||
-      candidates[0];
+      candidates.find((c) => sameType(c) && nameEq(c) && yearOk(c)) ||
+      candidates.find((c) => nameEq(c) && yearKnownEq(c)) ||
+      candidates.find((c) => sameType(c) && namePrefix(c) && yearKnownEq(c));
 
     return pick ? { value: `${pick.score}%`, url: pick.url } : null;
   } catch (err) {
@@ -95,36 +154,50 @@ export default {
       });
     }
 
+    if (request.method !== "GET") {
+      return errorResponse("Method not allowed.", 405, origin);
+    }
+
+    // Stops other websites' browsers, but a script can fake the Origin header,
+    // so the per-IP rate limit below is what actually protects the OMDb quota.
     if (!ALLOWED_ORIGINS.has(origin)) {
-      return new Response(JSON.stringify({ Response: "False", Error: "Origin not allowed." }), {
-        status: 403,
-        headers: corsHeaders(origin),
-      });
+      return errorResponse("Origin not allowed.", 403, origin);
     }
 
     const url = new URL(request.url);
-    const title = url.searchParams.get("t");
+    const title = (url.searchParams.get("t") || "").trim();
     if (!title) {
-      return new Response(JSON.stringify({ Response: "False", Error: "Missing title." }), {
-        status: 400,
-        headers: corsHeaders(origin),
-      });
+      return errorResponse("Missing title.", 400, origin);
+    }
+    if (title.length > MAX_TITLE_LENGTH) {
+      return errorResponse("Title is too long.", 400, origin);
     }
 
-    const omdbUrl = `https://www.omdbapi.com/?apikey=${env.OMDB_API_KEY}&t=${encodeURIComponent(title)}&plot=full`;
-    const omdbRes = await fetch(omdbUrl);
+    const cacheKey = title.toLowerCase();
+    const cached = cacheGet(cacheKey);
+    if (cached) {
+      return jsonResponse(cached, 200, origin, { "Cache-Control": "public, max-age=3600", "X-Proxy-Cache": "HIT" });
+    }
+
+    if (env.RATE_LIMITER) {
+      const ip = request.headers.get("CF-Connecting-IP") || "unknown";
+      const { success } = await env.RATE_LIMITER.limit({ key: ip });
+      if (!success) {
+        return errorResponse("Too many searches. Wait a minute and try again.", 429, origin);
+      }
+    }
 
     let data;
     try {
+      const omdbUrl = `https://www.omdbapi.com/?apikey=${env.OMDB_API_KEY}&t=${encodeURIComponent(title)}&plot=full`;
+      const omdbRes = await fetch(omdbUrl, { signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS) });
       data = await omdbRes.json();
     } catch (err) {
-      return new Response(await omdbRes.text(), {
-        status: omdbRes.status,
-        headers: corsHeaders(origin),
-      });
+      // Timeout, network failure, or a non-JSON error page from OMDb.
+      return errorResponse("Movie service is unavailable. Try again shortly.", 502, origin);
     }
 
-    if (data.Response !== "False") {
+    if (data.Response === "True") {
       const ratings = Array.isArray(data.Ratings) ? data.Ratings : [];
       const hasRT = ratings.some((r) => r.Source === "Rotten Tomatoes");
       if (!hasRT) {
@@ -135,11 +208,13 @@ export default {
           data.RottenTomatoesFallback = true;
         }
       }
+      cacheSet(cacheKey, data);
+      return jsonResponse(data, 200, origin, { "Cache-Control": "public, max-age=3600" });
     }
 
-    return new Response(JSON.stringify(data), {
-      status: omdbRes.status,
-      headers: corsHeaders(origin),
-    });
+    // "Movie not found!" is a normal 200 from OMDb. Quota/key problems
+    // ("Request limit reached!", "Invalid API key!") must not be cached.
+    const notFound = /not found/i.test(data.Error || "");
+    return jsonResponse(data, notFound ? 200 : 502, origin);
   },
 };
